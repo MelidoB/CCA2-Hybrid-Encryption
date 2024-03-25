@@ -5,14 +5,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <getopt.h>
-#include <string.h>
+#include <openssl/hmac.h>
+#include <string.h>  /* memcpy */
+#include <errno.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <openssl/sha.h>
-
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include "ske.h"
 #include "rsa.h"
 #include "prf.h"
+#define HM_LEN 32
 
+
+//victor why
 static const char* usage =
 "Usage: %s [OPTIONS]...\n"
 "Encrypt or decrypt data.\n\n"
@@ -50,25 +60,97 @@ enum modes {
  * (see KDF_KEY).
  * */
 
+#define KDF_KEY "qVHqkOVJLb7EolR9dsAMVwH1hRCYVx#I"
 #define HASHLEN 32 /* for sha256 */
+size_t lenofRSA;
 
-int kem_encrypt(const char* fnOut, const char* fnIn, RSA_KEY* K)
-{
-	/* TODO: encapsulate random symmetric key (SK) using RSA and SHA256;
-	 * encrypt fnIn with SK; concatenate encapsulation and cihpertext;
-	 * write to fnOut. */
-	return 0;
+int kem_encrypt(const char* outputFileName, const char* inputFileName, RSA_KEY* rsaKey) {
+    // Generate a random symmetric key using SKE
+    size_t rsaKeySizeBytes = rsa_numBytesN(rsaKey);
+    unsigned char* entropy = malloc(rsaKeySizeBytes);
+    SKE_KEY symmetricKey;
+    ske_keyGen(&symmetricKey, entropy, rsaKeySizeBytes);
+
+    // Encapsulate entropy using RSA and SHA256
+    unsigned char* rsaEncryptedEntropyWithHash = malloc(rsaKeySizeBytes + HASHLEN);
+    unsigned char* hash = malloc(HASHLEN);
+    SHA256(entropy, rsaKeySizeBytes, hash);
+    rsa_encrypt(rsaEncryptedEntropyWithHash, entropy, rsaKeySizeBytes, rsaKey);
+    memcpy(rsaEncryptedEntropyWithHash + rsaKeySizeBytes, hash, HASHLEN);
+
+    // Write encapsulated entropy to the output file
+    int outputFileDescriptor = open(outputFileName, O_RDWR | O_CREAT, S_IRWXU);
+
+    int bytesWritten = write(outputFileDescriptor, rsaEncryptedEntropyWithHash, rsaKeySizeBytes + HASHLEN);
+
+    close(outputFileDescriptor);
+
+    // Encrypt the input file using the symmetric key
+    unsigned char* initializationVector = malloc(16);
+    randBytes(initializationVector, 16);
+    ske_encrypt_file(outputFileName, inputFileName, &symmetricKey, initializationVector, rsaKeySizeBytes + HASHLEN);
+
+    // Cleanup
+    free(entropy);
+    free(rsaEncryptedEntropyWithHash);
+    free(hash);
+    free(initializationVector);
+
+    return 0;
 }
+
 
 /* NOTE: make sure you check the decapsulation is valid before continuing */
-int kem_decrypt(const char* fnOut, const char* fnIn, RSA_KEY* K)
-{
-	/* TODO: write this. */
-	/* step 1: recover the symmetric key */
-	/* step 2: check decapsulation */
-	/* step 3: derive key from ephemKey and decrypt data. */
-	return 0;
+int kem_decrypt(const char* outputFileName, const char* inputFileName, RSA_KEY* rsaKey) {
+    // Open the encrypted file and get its size
+    int inputFileDescriptor;
+    unsigned char* mappedFile;
+    size_t fileSize;
+    struct stat st;
+    
+    inputFileDescriptor = open(inputFileName, O_RDONLY);
+    stat(inputFileName, &st);
+    fileSize = st.st_size;
+
+    // Map the encrypted file into memory
+    mappedFile = mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, inputFileDescriptor, 0);
+    close(inputFileDescriptor);
+
+    // Extract the RSA-encrypted entropy
+    size_t rsaKeySizeBytes = rsa_numBytesN(rsaKey);
+    unsigned char* encryptedEntropy = malloc(rsaKeySizeBytes);
+    memcpy(encryptedEntropy, mappedFile, rsaKeySizeBytes);
+
+    // Decrypt the RSA-encrypted entropy to retrieve the original entropy
+    unsigned char* decryptedEntropy = malloc(rsaKeySizeBytes);
+    rsa_decrypt(decryptedEntropy, encryptedEntropy, rsaKeySizeBytes, rsaKey);
+
+    // Compute the hash of the decrypted entropy
+    unsigned char* computedHash = malloc(HASHLEN);
+    SHA256(decryptedEntropy, rsaKeySizeBytes, computedHash);
+
+    // Extract the hash from the file
+    unsigned char* fileHash = malloc(HASHLEN);
+    memcpy(fileHash, mappedFile + rsaKeySizeBytes, HASHLEN);
+
+
+    // Generate symmetric key from decrypted entropy
+    SKE_KEY symmetricKey;
+    ske_keyGen(&symmetricKey, decryptedEntropy, rsaKeySizeBytes);
+
+    // Decrypt the input file using the symmetric key
+    ske_decrypt_file(outputFileName, inputFileName, &symmetricKey, rsaKeySizeBytes + HASHLEN);
+
+    // Cleanup
+    munmap(mappedFile, fileSize);
+    free(encryptedEntropy);
+    free(decryptedEntropy);
+    free(computedHash);
+    free(fileHash);
+
+    return 0;
 }
+
 
 int main(int argc, char *argv[]) {
 	/* define long options */
@@ -100,13 +182,13 @@ int main(int argc, char *argv[]) {
 	size_t nBits = 1024;
 	while ((c = getopt_long(argc, argv, "edhi:o:k:r:g:b:", long_opts, &opt_index)) != -1) {
 		switch (c) {
-			case 'h':
+			case 'h': // help
 				printf(usage,argv[0],nBits);
 				return 0;
-			case 'i':
+			case 'i': // argument to fnIn
 				strncpy(fnIn,optarg,FNLEN);
 				break;
-			case 'o':
+			case 'o': 
 				strncpy(fnOut,optarg,FNLEN);
 				break;
 			case 'k':
@@ -123,7 +205,7 @@ int main(int argc, char *argv[]) {
 				break;
 			case 'g':
 				mode = GEN;
-				strncpy(fnOut,optarg,FNLEN);
+				strncpy(fnOut,optarg,FNLEN); 
 				break;
 			case 'b':
 				nBits = atol(optarg);
@@ -137,10 +219,46 @@ int main(int argc, char *argv[]) {
 	/* TODO: finish this off.  Be sure to erase sensitive data
 	 * like private keys when you're done with them (see the
 	 * rsa_shredKey function). */
+
+	
+	RSA_KEY K; 
+	
+	// Define Variables to prevent redefinition error
+	FILE* rsa_publicKey;
+	FILE* rsa_privateKey;
+
 	switch (mode) {
 		case ENC:
+			rsa_publicKey = fopen(fnKey,"r");
+			rsa_readPublic(rsa_publicKey, &K);
+			kem_encrypt(fnOut,fnIn,&K);
+			fclose(rsa_publicKey);
+			rsa_shredKey(&K);
+
+			break;
 		case DEC:
+			rsa_privateKey = fopen(fnKey,"r");
+			rsa_readPrivate(rsa_privateKey, &K);
+			kem_decrypt(fnOut,fnIn,&K);
+
+			fclose(rsa_privateKey);
+			
+			rsa_shredKey(&K);
+
+			break;
 		case GEN:
+			rsa_keyGen(nBits,&K);
+			rsa_privateKey = fopen(fnOut,"w+");
+			rsa_writePrivate(rsa_privateKey, &K);
+			strcat(fnOut,".pub");
+			rsa_publicKey = fopen(fnOut,"w+");
+			rsa_writePublic(rsa_publicKey, &K);
+
+			fclose(rsa_privateKey);
+			fclose(rsa_publicKey);
+
+			rsa_shredKey(&K);
+			break;
 		default:
 			return 1;
 	}
