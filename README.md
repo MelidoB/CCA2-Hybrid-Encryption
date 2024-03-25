@@ -1,4 +1,6 @@
 Members:
 
-Melido Bello 
+
+Melido Bello
+
 Thierno Dicko
